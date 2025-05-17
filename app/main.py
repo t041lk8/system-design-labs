@@ -9,13 +9,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from sqlalchemy.orm import Session
 import uvicorn
+
+from db.database import get_db
+from db.models import User as UserModel
+from db.models import Service as ServiceModel
+from db.models import Order as OrderModel
+from db.models import OrderService as OrderServiceModel
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-# Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -33,26 +39,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class User(BaseModel):
+class UserBase(BaseModel):
     username: str
     full_name: Optional[str] = None
     disabled: Optional[bool] = None
 
-class UserInDB(User):
-    hashed_password: str
+class UserCreate(UserBase):
+    password: str
 
-class Service(BaseModel):
-    id: uuid.UUID
+class User(UserBase):
+    class Config:
+        orm_mode = True
+
+class ServiceBase(BaseModel):
     name: str
     description: str
     price: float
 
-class Order(BaseModel):
+class ServiceCreate(ServiceBase):
+    pass
+
+class Service(ServiceBase):
     id: uuid.UUID
-    user_id: str 
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+class OrderBase(BaseModel):
     services: List[uuid.UUID]
+
+class OrderCreate(OrderBase):
+    pass
+
+class Order(OrderBase):
+    id: uuid.UUID
+    user_id: str
     total_price: float
     created_at: datetime
+
+    class Config:
+        orm_mode = True
 
 class Token(BaseModel):
     access_token: str
@@ -61,31 +88,16 @@ class Token(BaseModel):
 class TokenData(BaseModel):
     username: Optional[str] = None
 
-class OrderCreate(BaseModel):
-    services: List[uuid.UUID]
-
-# In-memory storage
-users_db = {
-    "admin": {
-        "username": "admin",
-        "full_name": "Administrator",
-        "hashed_password": pwd_context.hash("secret"),
-        "disabled": False
-    }
-}
-
-services_db = {}
-orders_db = {}
-
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
-def get_user(db, username: str):
-    if username in db:
-        user_dict = db[username]
-        return UserInDB(**user_dict)
+def get_password_hash(password):
+    return pwd_context.hash(password)
 
-def authenticate_user(db, username: str, password: str):
+def get_user(db: Session, username: str):
+    return db.query(UserModel).filter(UserModel.username == username).first()
+
+def authenticate_user(db: Session, username: str, password: str):
     user = get_user(db, username)
     if not user:
         return False
@@ -103,7 +115,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -117,14 +129,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         token_data = TokenData(username=username)
     except JWTError:
         raise credentials_exception
-    user = get_user(users_db, username=token_data.username)
+    user = get_user(db, username=token_data.username)
     if user is None:
         raise credentials_exception
     return user
 
 @app.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = authenticate_user(users_db, form_data.username, form_data.password)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -138,75 +150,156 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/users", response_model=User)
-async def create_user(user: User, current_user: User = Depends(get_current_user)):
-    if user.username in users_db:
+async def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = get_user(db, username=user.username)
+    if db_user:
         raise HTTPException(status_code=400, detail="Username already registered")
-    users_db[user.username] = user.dict()
-    return user
+    
+    hashed_password = get_password_hash(user.password)
+    db_user = UserModel(
+        username=user.username,
+        full_name=user.full_name,
+        hashed_password=hashed_password,
+        disabled=user.disabled
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
 
 @app.get("/users/all", response_model=List[User])
-async def get_all_users(current_user: User = Depends(get_current_user)):
-    return list(users_db.values())
+async def get_all_users(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    users = db.query(UserModel).all()
+    return users
 
 @app.get("/users/search", response_model=List[User])
-async def search_users(name_mask: str, current_user: User = Depends(get_current_user)):
-    return [
-        user for user in users_db.values()
-        if user.get("full_name") and name_mask.lower() in user["full_name"].lower()
-    ]
+async def search_users(name_mask: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    users = db.query(UserModel).filter(UserModel.full_name.ilike(f"%{name_mask}%")).all()
+    return users
 
 @app.get("/users/{username}", response_model=User)
-async def get_user_by_username(username: str, current_user: User = Depends(get_current_user)):
-    if username not in users_db:
+async def get_user_by_username(username: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    user = get_user(db, username)
+    if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return users_db[username]
+    return user
 
 @app.post("/services", response_model=Service)
-async def create_service(service: Service, current_user: User = Depends(get_current_user)):
-    service_id = uuid.uuid4()
-    service.id = service_id
-    services_db[service_id] = service.dict()
-    return service
+async def create_service(service: ServiceCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    db_service = ServiceModel(**service.dict())
+    db.add(db_service)
+    db.commit()
+    db.refresh(db_service)
+    return db_service
 
 @app.get("/services", response_model=List[Service])
-async def get_services(current_user: User = Depends(get_current_user)):
-    return list(services_db.values())
+async def get_services(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    services = db.query(ServiceModel).all()
+    return services
 
 @app.post("/orders", response_model=Order)
-async def create_order(order: OrderCreate, current_user: User = Depends(get_current_user)):
-    order_id = uuid.uuid4()
-    user_id = current_user.username
-    created_at = datetime.utcnow()
-    total_price = sum(services_db[service_id]["price"] for service_id in order.services if service_id in services_db)
-    order_data = Order(
-        id=order_id,
-        user_id=user_id,
-        services=order.services,
-        total_price=total_price,
-        created_at=created_at
+async def create_order(order: OrderCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    services = db.query(ServiceModel).filter(ServiceModel.id.in_(order.services)).all()
+    total_price = sum(service.price for service in services)
+    
+    db_order = OrderModel(
+        user_id=current_user.username,
+        total_price=total_price
     )
-    orders_db[order_id] = order_data.dict()
-    return order_data
+    db.add(db_order)
+    db.commit()
+    db.refresh(db_order)
+    
+    for service_id in order.services:
+        order_service = OrderServiceModel(
+            order_id=db_order.id,
+            service_id=service_id
+        )
+        db.add(order_service)
+    
+    db.commit()
+    db.refresh(db_order)
+    
+    service_ids = [os.service_id for os in db_order.services]
+    return Order(
+        id=db_order.id,
+        user_id=db_order.user_id,
+        services=service_ids,
+        total_price=db_order.total_price,
+        created_at=db_order.created_at
+    )
 
 @app.get("/orders", response_model=List[Order])
-async def get_all_orders(current_user: User = Depends(get_current_user)):
-    return list(orders_db.values())
+async def get_all_orders(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    orders = db.query(OrderModel).filter(OrderModel.user_id == current_user.username).all()
+    return [
+        Order(
+            id=order.id,
+            user_id=order.user_id,
+            services=[os.service_id for os in order.services],
+            total_price=order.total_price,
+            created_at=order.created_at
+        )
+        for order in orders
+    ]
 
 @app.get("/orders/{order_id}", response_model=Order)
-async def get_order(order_id: uuid.UUID, current_user: User = Depends(get_current_user)):
-    if order_id not in orders_db:
+async def get_order(order_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
+    if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    return orders_db[order_id]
+    if order.user_id != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to access this order")
+    
+    return Order(
+        id=order.id,
+        user_id=order.user_id,
+        services=[os.service_id for os in order.services],
+        total_price=order.total_price,
+        created_at=order.created_at
+    )
 
 @app.put("/orders/{order_id}/services", response_model=Order)
-async def add_services_to_order(order_id: uuid.UUID, service_ids: List[uuid.UUID], current_user: User = Depends(get_current_user)):
-    if order_id not in orders_db:
+async def add_services_to_order(
+    order_id: uuid.UUID,
+    service_ids: List[uuid.UUID],
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
+    if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    order = orders_db[order_id]
-    order["services"].extend(service_ids)
-    total_price = sum(services_db[service_id]["price"] for service_id in order["services"])
-    order["total_price"] = total_price
-    return order
+    if order.user_id != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to modify this order")
+    
+    new_services = db.query(ServiceModel).filter(ServiceModel.id.in_(service_ids)).all()
+    if not new_services:
+        raise HTTPException(status_code=404, detail="No valid services found")
+    
+    for service_id in service_ids:
+        order_service = OrderServiceModel(
+            order_id=order.id,
+            service_id=service_id
+        )
+        db.add(order_service)
+    
+    db.commit()
+    
+    order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
+    
+    all_services = db.query(ServiceModel).join(OrderServiceModel).filter(OrderServiceModel.order_id == order.id).all()
+    order.total_price = sum(service.price for service in all_services)
+    
+    db.commit()
+    db.refresh(order)
+    
+    return Order(
+        id=order.id,
+        user_id=order.user_id,
+        services=[os.service_id for os in order.services],
+        total_price=order.total_price,
+        created_at=order.created_at
+    )
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
