@@ -14,9 +14,11 @@ import uvicorn
 
 from db.database import get_db
 from db.models import User as UserModel
-from db.models import Service as ServiceModel
-from db.models import Order as OrderModel
-from db.models import OrderService as OrderServiceModel
+from db.mongodb import (
+    ServiceMongo, OrderMongo,
+    create_service, get_services, get_service,
+    create_order, get_orders, get_order, update_order_services
+)
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
@@ -60,20 +62,20 @@ class ServiceCreate(ServiceBase):
     pass
 
 class Service(ServiceBase):
-    id: uuid.UUID
+    id: str
     created_at: datetime
 
     class Config:
         orm_mode = True
 
 class OrderBase(BaseModel):
-    services: List[uuid.UUID]
+    services: List[str]
 
 class OrderCreate(OrderBase):
     pass
 
 class Order(OrderBase):
-    id: uuid.UUID
+    id: str
     user_id: str
     total_price: float
     created_at: datetime
@@ -185,121 +187,68 @@ async def get_user_by_username(username: str, db: Session = Depends(get_db), cur
     return user
 
 @app.post("/services", response_model=Service)
-async def create_service(service: ServiceCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    db_service = ServiceModel(**service.dict())
-    db.add(db_service)
-    db.commit()
-    db.refresh(db_service)
-    return db_service
+async def create_service_endpoint(service: ServiceCreate, current_user: User = Depends(get_current_user)):
+    service_mongo = ServiceMongo(**service.dict())
+    created_service = await create_service(service_mongo)
+    return created_service
 
 @app.get("/services", response_model=List[Service])
-async def get_services(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    services = db.query(ServiceModel).all()
+async def get_services_endpoint(current_user: User = Depends(get_current_user)):
+    services = await get_services()
     return services
 
 @app.post("/orders", response_model=Order)
-async def create_order(order: OrderCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    services = db.query(ServiceModel).filter(ServiceModel.id.in_(order.services)).all()
-    total_price = sum(service.price for service in services)
-    
-    db_order = OrderModel(
+async def create_order_endpoint(order: OrderCreate, current_user: User = Depends(get_current_user)):
+    total_price = 0
+    for service_id in order.services:
+        service = await get_service(service_id)
+        if not service:
+            raise HTTPException(status_code=404, detail=f"Service {service_id} not found")
+        total_price += service.price
+
+    order_mongo = OrderMongo(
         user_id=current_user.username,
+        services=order.services,
         total_price=total_price
     )
-    db.add(db_order)
-    db.commit()
-    db.refresh(db_order)
-    
-    for service_id in order.services:
-        order_service = OrderServiceModel(
-            order_id=db_order.id,
-            service_id=service_id
-        )
-        db.add(order_service)
-    
-    db.commit()
-    db.refresh(db_order)
-    
-    service_ids = [os.service_id for os in db_order.services]
-    return Order(
-        id=db_order.id,
-        user_id=db_order.user_id,
-        services=service_ids,
-        total_price=db_order.total_price,
-        created_at=db_order.created_at
-    )
+    created_order = await create_order(order_mongo)
+    return created_order
 
 @app.get("/orders", response_model=List[Order])
-async def get_all_orders(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    orders = db.query(OrderModel).filter(OrderModel.user_id == current_user.username).all()
-    return [
-        Order(
-            id=order.id,
-            user_id=order.user_id,
-            services=[os.service_id for os in order.services],
-            total_price=order.total_price,
-            created_at=order.created_at
-        )
-        for order in orders
-    ]
+async def get_orders_endpoint(current_user: User = Depends(get_current_user)):
+    orders = await get_orders(current_user.username)
+    return orders
 
 @app.get("/orders/{order_id}", response_model=Order)
-async def get_order(order_id: uuid.UUID, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
+async def get_order_endpoint(order_id: str, current_user: User = Depends(get_current_user)):
+    order = await get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     if order.user_id != current_user.username:
         raise HTTPException(status_code=403, detail="Not authorized to access this order")
-    
-    return Order(
-        id=order.id,
-        user_id=order.user_id,
-        services=[os.service_id for os in order.services],
-        total_price=order.total_price,
-        created_at=order.created_at
-    )
+    return order
 
 @app.put("/orders/{order_id}/services", response_model=Order)
-async def add_services_to_order(
-    order_id: uuid.UUID,
-    service_ids: List[uuid.UUID],
-    db: Session = Depends(get_db),
+async def add_services_to_order_endpoint(
+    order_id: str,
+    service_ids: List[str],
     current_user: User = Depends(get_current_user)
 ):
-    order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
+    order = await get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     if order.user_id != current_user.username:
         raise HTTPException(status_code=403, detail="Not authorized to modify this order")
-    
-    new_services = db.query(ServiceModel).filter(ServiceModel.id.in_(service_ids)).all()
-    if not new_services:
-        raise HTTPException(status_code=404, detail="No valid services found")
-    
+
+    total_price = 0
     for service_id in service_ids:
-        order_service = OrderServiceModel(
-            order_id=order.id,
-            service_id=service_id
-        )
-        db.add(order_service)
-    
-    db.commit()
-    
-    order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
-    
-    all_services = db.query(ServiceModel).join(OrderServiceModel).filter(OrderServiceModel.order_id == order.id).all()
-    order.total_price = sum(service.price for service in all_services)
-    
-    db.commit()
-    db.refresh(order)
-    
-    return Order(
-        id=order.id,
-        user_id=order.user_id,
-        services=[os.service_id for os in order.services],
-        total_price=order.total_price,
-        created_at=order.created_at
-    )
+        service = await get_service(service_id)
+        if not service:
+            raise HTTPException(status_code=404, detail=f"Service {service_id} not found")
+        total_price += service.price
+
+    updated_order = await update_order_services(order_id, service_ids, total_price)
+    return updated_order
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
