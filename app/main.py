@@ -19,6 +19,8 @@ from db.mongodb import (
     create_service, get_services, get_service,
     create_order, get_orders, get_order, update_order_services
 )
+from db.cache_decorators import cache_read_through, cache_write_through
+from db.redis_client import redis_client
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
@@ -96,11 +98,12 @@ def verify_password(plain_password, hashed_password):
 def get_password_hash(password):
     return pwd_context.hash(password)
 
-def get_user(db: Session, username: str):
+@cache_read_through(prefix="user", ttl=3600)
+async def get_user(db: Session, username: str):
     return db.query(UserModel).filter(UserModel.username == username).first()
 
-def authenticate_user(db: Session, username: str, password: str):
-    user = get_user(db, username)
+async def authenticate_user(db: Session, username: str, password: str):
+    user = await get_user(db, username)
     if not user:
         return False
     if not verify_password(password, user.hashed_password):
@@ -131,14 +134,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         token_data = TokenData(username=username)
     except JWTError:
         raise credentials_exception
-    user = get_user(db, username=token_data.username)
+    user = await get_user(db, username=token_data.username)
     if user is None:
         raise credentials_exception
     return user
 
 @app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = authenticate_user(db, form_data.username, form_data.password)
+    user = await authenticate_user(db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -151,12 +154,8 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-@app.post("/users", response_model=User)
-async def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = get_user(db, username=user.username)
-    if db_user:
-        raise HTTPException(status_code=400, detail="Username already registered")
-    
+@cache_write_through(prefix="user", invalidate_pattern="*")
+async def create_user_in_db(db: Session, user: UserCreate):
     hashed_password = get_password_hash(user.password)
     db_user = UserModel(
         username=user.username,
@@ -169,19 +168,33 @@ async def create_user(user: UserCreate, db: Session = Depends(get_db)):
     db.refresh(db_user)
     return db_user
 
+@app.post("/users", response_model=User)
+async def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = await get_user(db, username=user.username)
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    return await create_user_in_db(db, user)
+
+@cache_read_through(prefix="users", ttl=3600)
+async def get_all_users_from_db(db: Session):
+    return db.query(UserModel).all()
+
 @app.get("/users/all", response_model=List[User])
 async def get_all_users(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    users = db.query(UserModel).all()
-    return users
+    return await get_all_users_from_db(db)
+
+@cache_read_through(prefix="users_search", ttl=3600)
+async def search_users_from_db(db: Session, name_mask: str):
+    return db.query(UserModel).filter(UserModel.full_name.ilike(f"%{name_mask}%")).all()
 
 @app.get("/users/search", response_model=List[User])
 async def search_users(name_mask: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    users = db.query(UserModel).filter(UserModel.full_name.ilike(f"%{name_mask}%")).all()
-    return users
+    return await search_users_from_db(db, name_mask)
 
 @app.get("/users/{username}", response_model=User)
 async def get_user_by_username(username: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    user = get_user(db, username)
+    user = await get_user(db, username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
