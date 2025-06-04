@@ -21,6 +21,7 @@ from db.mongodb import (
 )
 from db.cache_decorators import cache_read_through, cache_write_through
 from db.redis_client import redis_client
+from db.kafka_client import get_kafka_producer, SERVICE_TOPIC
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
@@ -201,9 +202,17 @@ async def get_user_by_username(username: str, db: Session = Depends(get_db), cur
 
 @app.post("/services", response_model=Service)
 async def create_service_endpoint(service: ServiceCreate, current_user: User = Depends(get_current_user)):
-    service_mongo = ServiceMongo(**service.dict())
-    created_service = await create_service(service_mongo)
-    return created_service
+    # Create service command
+    service_data = service.dict()
+    
+    # Send command to Kafka
+    producer = get_kafka_producer()
+    producer.send(SERVICE_TOPIC, value=service_data)
+    producer.flush()
+    
+    # Create temporary service object for response
+    service_mongo = ServiceMongo(**service_data)
+    return service_mongo
 
 @app.get("/services", response_model=List[Service])
 async def get_services_endpoint(current_user: User = Depends(get_current_user)):
